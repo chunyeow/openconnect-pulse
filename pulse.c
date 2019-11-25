@@ -143,22 +143,50 @@ static void buf_fill_eap_len(struct oc_text_buf *buf, int ofs)
 		store_be16(buf->data + ofs + 2, buf->pos - ofs);
 }
 
+static void buf_append_avp_with_flags(struct oc_text_buf *buf, uint32_t type, uint16_t flags, const void *bytes, int len)
+{
+    buf_append_be32(buf, type);
+    buf_append_be16(buf, flags);
+    buf_append_be16(buf, len + 12);
+    buf_append_be32(buf, VENDOR_JUNIPER2);
+    buf_append_bytes(buf, bytes, len);
+    if (len & 3) {
+        uint32_t pad = 0;
+        buf_append_bytes(buf, &pad, 4 - ( len & 3 ));
+    }
+}
+
 static void buf_append_avp(struct oc_text_buf *buf, uint32_t type, const void *bytes, int len)
 {
-	buf_append_be32(buf, type);
-	buf_append_be16(buf, 0x8000);
-	buf_append_be16(buf, len + 12);
-	buf_append_be32(buf, VENDOR_JUNIPER2);
-	buf_append_bytes(buf, bytes, len);
-	if (len & 3) {
-		uint32_t pad = 0;
-		buf_append_bytes(buf, &pad, 4 - ( len & 3 ));
-	}
+    buf_append_avp_with_flags(buf, type, 0x8000, bytes, len);
 }
 
 static void buf_append_avp_string(struct oc_text_buf *buf, uint32_t type, const char *str)
 {
 	buf_append_avp(buf, type, str, strlen(str));
+}
+
+static void buf_append_avp_string_flags(struct oc_text_buf *buf, uint32_t type, uint16_t flags, const char *str) {
+    buf_append_avp_with_flags(buf, type, flags, str, strlen(str));
+}
+
+// buf_append_avp_string_subtype appends a AVP string with JUNIPER subtype added
+static void buf_append_avp_string_subtype(struct oc_text_buf *buf, uint32_t type, uint32_t subvendor, uint8_t subtype, const char *str, int len)
+{
+    if (len == -1) {
+        len = strlen(str);
+    }
+
+	buf_append_be32(buf, type);
+	buf_append_be16(buf, 0xC000);
+	buf_append_be16(buf, len + 16);
+	buf_append_be32(buf, VENDOR_JUNIPER2);
+	buf_append_be32(buf, (subvendor << 8) | subtype);
+	buf_append_bytes(buf, str, len);
+	if (len & 3) {
+		uint32_t pad = 0;
+		buf_append_bytes(buf, &pad, 4 - ( len & 3 ));
+	}
 }
 
 static void buf_append_avp_be32(struct oc_text_buf *buf, uint32_t type, uint32_t val)
@@ -877,6 +905,150 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 	return ret;
 }
 
+static int pulse_request_tncc_reply(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
+{
+	const char *message = "<parameter name=\"AntiVirus\" value=\"product_id=362;"
+						  "product_sig=477;"
+						  "product_name=Windows Defender;"
+						  "vendor_name=Microsoft Corporation;"
+						  "product_version=4.18.1902.5;"
+						  "is_authentic=UNKNOWN;"
+						  "translated_product_name=Windows Defender;"
+						  "translated_vendor_name=Microsoft Corp.;"
+						  "translated_product_version=4.18.1902.5;"
+						  "gmt_offset=-60;"
+						  "fsrtp=YES;"
+						  "last_scan_time=;"
+						  "data_file_details=time~2019/11/30 16:27:24^version~1.305.3093.0|;"
+						  "virus_def_sig=;"
+						  "def_update_in_progress=UNKNOWN;"
+						  "scan_in_progress=YES;"
+						  "services_running=UNKNOWN;"
+						  "error=;\">"
+						  "<parameter name=\"system_info\" value=\"os_version=2.6.2;sp_version=0;\">";
+	const char *acceptLanguage = "Accept-Language: en-US";
+
+	struct oc_text_buf *reqbuf = buf_alloc();
+	struct oc_text_buf *encapsulation1 = buf_alloc();
+	struct oc_text_buf *encapsulation2 = buf_alloc();
+	char encapsulationBytes[9];
+
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x18, message, -1);
+
+	buf_append_avp_with_flags(encapsulation1, 0x0ce4, 0xc000, reqbuf->data, reqbuf->pos);
+	buf_append_avp_string_flags(encapsulation1, 0xce5, 0xc000, acceptLanguage);
+	buf_append_avp(encapsulation1, 0xcf3, (unsigned char*)"\x00\x00\x00\x01", 4);
+
+	// Encapsulate in second encapsulation packet
+	store_be32(encapsulationBytes, EXPANDED_JUNIPER);
+	store_be32(encapsulationBytes+4, 0x03);
+	encapsulationBytes[8] = 0x01;
+
+	buf_append_bytes(encapsulation2, encapsulationBytes, 9);
+	buf_append_avp_with_flags(encapsulation2, 0x13, 0xc000, encapsulation1->data, encapsulation1->pos);
+	buf_free(encapsulation1);
+
+	// Build AVP packet with specific settings
+	buf_append_be32(buf, 0x4f);
+	buf_append_be16(buf, 0x4000);
+	// Total length of data, plus length of this packet, plus length of additional contents
+	buf_append_be16(buf, encapsulation2->pos + 12);
+	buf_append_be32(buf, 0x020202a9); // Vendor
+
+	buf_append_bytes(buf, encapsulation2->data, encapsulation2->pos);
+
+	// Add final padding
+	if (encapsulation2->pos & 3) {
+		// These where added instead of normal padding?
+		const char *pad = "\x2e\x38\x39";
+		buf_append_bytes(buf, pad, 4 - (encapsulation2->pos & 3 ));
+	}
+
+	return 0;
+}
+
+static int pulse_request_tncc_info(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
+{
+	const char *message = "{\"messageType\":0,\"clientType\":1,\"message\":[]}";
+	const char *parameters = "<parameter name=\"policy_request\" value=\"message_version=3;sub_version=2;\"><parameter name=\"esap\" value=\"esap_version=3.4.9;fileinfo=name:libwaaddon.dll^sha256:7d9830176131681dd492e8ba1d202c993e0a85bfe442820d02814c95ddff5892^version:4.3.890.0^|name:libwaapi.dll^sha256:a7081a6b2c258f33055491c2792e308b4ba066c5de30b53e0d446ef0240bc12f^version:4.3.890.0^|name:libwaapi_v3.dll^sha256:ede797caa21122660e96471d6104c57a841589d312f3f902cac0cce51d5a3d48^|name:libwaheap.dll^sha256:e70d3376abd1fd1312551b70dc9cc2cfe5341e4a8f496aa59ca5948c25d0defb^version:4.3.890.0^|name:libwalocal.dll^sha256:5c087b5f30a8c2f663015849c89e66c556dac32105ca6ecbd725c18f894f6e2c^version:4.3.890.0^|name:libwaresource.dll^sha256:093272078379e96d08c46b06a44f0494556708e196a091afe45ed036c4389cf0^|name:libwautils.dll^sha256:1a6865853a73579dcd0eba6fe5cf532f0ffee987f5c9c74b4401d361987e9b04^version:4.3.890.0^|name:libwavmodapi.dll^sha256:6db0f3a804fe5a3ce412dd6cf5828e5fb9f8327de9e544568789151f46b7acf7^version:4.3.890.0^|name:vmod.dat^sha256:289aae208c7464fcfa86131d848827bd7df63376199163fb6af6cf78a40400a1^|name:wa_3rd_party_host_32.exe^sha256:ecd08ec56f49d745b97d5d286757646d5773e004897662d3c4451d89e31bae26^version:4.3.890.0^|name:wa_3rd_party_host_64.exe^sha256:dcf7f06a7950c9967a971a73143472cfc9cec4a0a81c297f13929f404d48a0e8^version:4.3.890.0^|;has_file_versions=YES;needs_exact_sdk=NO;opswat_sdk_version=4;\"><parameter name=\"system_info\" value=\"os_version=2.6.2;sp_version=0;hc_mode=userMode;\">";
+	const char data[] = {
+			0x00, 0x07, 0x00, 0x96, 0x00, 0x00, 0x01, 0x37,
+			0x00, 0x02, 0x00, 0x8e, 0x00, 0x07, 0x00, 0x1e,
+			0x00, 0x00, 0x01, 0x37, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02,
+			0x00, 0x04, 0x00, 0x01, 0x37, 0x00, 0x00, 0x07,
+			0x00, 0x13, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00,
+			0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+			0x04, 0x00, 0x01, 0x37, 0x80, 0x00, 0x07, 0x00,
+			0x01, 0x00, 0x00, 0x07, 0x00, 0x08, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
+			0x00, 0x01, 0x00, 0x00, 0x0b, 0x00, 0x04, 0x00,
+			0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x01,
+			0x00, 0x0b, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+			0x00, 0x08, 0x00, 0x01, 0x02, 0x00, 0x0b, 0x00,
+			0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x08, 0x00,
+			0x01, 0x03, 0x00, 0x0b, 0x00, 0x04, 0x00, 0x00,
+			0x00, 0x01};
+	const char *funkMessage = "<FunkMessage VendorID='2636' ProductID='1' Version='1' Platform='Windows \?\?' ClientType='Pulse'> <Present SequenceID='0'></Present>  </FunkMessage>";
+	const char *attributes = "<Attribute Name='00:ff:ff:ff:ff:01' Value='MACAddress' /><Attribute Name='00:ff:ff:ff:ff:02' Value='MACAddress' /><Attribute Name='DESKTOP-XXXXXXX' Value='NETBIOSName' /><Attribute Name='version:2.10.0^sp:0^server:0^64bit:1^' Value='OSCHECKS' />";
+	const char *macaddr = "set macaddr;00:00:00:00:00:00";
+	const char *policyRequest = "policy request\x00v7\x00";
+	const char *acceptLanguage = "Accept-Language: en-US";
+
+	// We have multiple buffers, because there are multiple levels of encapsulation
+	struct oc_text_buf *reqbuf = buf_alloc();
+	struct oc_text_buf *encapsulation1 = buf_alloc();
+	struct oc_text_buf *encapsulation2 = buf_alloc();
+	char encapsulationBytes[9];
+
+	// Build inner packet (flags 0xc0)
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x1b, message, -1);
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x18, parameters, -1);
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x17, data, 154);
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x01, funkMessage, strlen(funkMessage)+1); // funkMessage should include null-terminator
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER2, 0x01, attributes, strlen(attributes)+1); // attributes should include null-terminator
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER2, 0x16, macaddr, -1);
+	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER2, 0x16, policyRequest, 18);
+
+	// Encapsulate inner packet
+	buf_append_avp_with_flags(encapsulation1, 0x0ce4, 0xc000, reqbuf->data, reqbuf->pos);
+	buf_append_avp_string_flags(encapsulation1, 0xce5, 0xc000, acceptLanguage);
+	buf_append_avp(encapsulation1, 0xcf3, (unsigned char*)"\x00\x00\x00\x01", 4);
+	buf_free(reqbuf);
+
+	// Encapsulate in second encapsulation packet
+	store_be32(encapsulationBytes, EXPANDED_JUNIPER);
+	store_be32(encapsulationBytes+4, 0x03);
+	encapsulationBytes[8] = 0x01;
+	buf_append_bytes(encapsulation2, encapsulationBytes, 9);
+	buf_append_avp_with_flags(encapsulation2, 0x13, 0xc000, encapsulation1->data, encapsulation1->pos);
+	buf_free(encapsulation1);
+
+	// Add local hostname
+	buf_append_avp_string(buf,0x0d6d, vpninfo->localname);
+
+	// Build AVP packet with specific settings
+	buf_append_be32(buf, 0x4f);
+	buf_append_be16(buf, 0x4000);
+	// Total length of data, plus length of this packet, plus length of additional contents
+	buf_append_be16(buf, encapsulation2->pos + 12);
+	buf_append_be32(buf, 0x02010911); // Vendor
+
+	buf_append_bytes(buf, encapsulation2->data, encapsulation2->pos);
+
+	// Add final padding
+	if (encapsulation2->pos & 3) {
+		uint32_t pad = 0;
+		buf_append_bytes(buf, &pad, 4 - (encapsulation2->pos & 3 ));
+	}
+
+	buf_free(encapsulation2);
+	return 0;
+}
+
 static int pulse_request_session_kill(struct openconnect_info *vpninfo, struct oc_text_buf *reqbuf,
 				      int sessions, unsigned char *eap)
 {
@@ -1260,8 +1432,8 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	void *avp_p, *p;
 	unsigned char *eap;
 	int cookie_found = 0;
-	int j2_found = 0, realms_found = 0, realm_entry = 0, old_sessions = 0, gtc_found = 0;
-	uint8_t j2_code = 0;
+	int j2_found = 0, realms_found = 0, realm_entry = 0, old_sessions = 0, gtc_found = 0, tncc_found = 0;
+	uint8_t j2_code = 0, tncc_code = 0;
 	void *ttls = NULL;
 	char *user_prompt = NULL, *pass_prompt = NULL, *gtc_prompt = NULL, *signin_prompt = NULL;
 	char *user2_prompt = NULL, *pass2_prompt = NULL;
@@ -1550,7 +1722,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	else
 		prompt_flags &= ~PROMPT_GTC_NEXT;
 
-	realm_entry = realms_found = j2_found = old_sessions = 0, gtc_found = 0;
+	realm_entry = realms_found = j2_found = old_sessions = 0, gtc_found = tncc_found = 0;
 	eap = recv_eap_packet(vpninfo, ttls, (void *)bytes, sizeof(bytes));
 	if (!eap) {
 		ret = -EIO;
@@ -1663,13 +1835,35 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 				gtc_found = 1;
 				free(gtc_prompt);
 				gtc_prompt = strndup(avp_c + 5, avp_len - 5);
-			} else if (avp_len == 13 && load_be32(avp_c + 4) == EXPANDED_JUNIPER) {
+			} else if (load_be32(avp_c + 4) == EXPANDED_JUNIPER) {
 				switch (load_be32(avp_c + 8)) {
 				case 2: /*  Expanded Juniper/2: password */
+					if (avp_len != 13) { // Password requests are expected to be 13 bytes long
+						goto auth_unknown;
+					}
 					j2_found = 1;
 					j2_code = avp_c[12];
 					break;
 
+				case 3: /* Host checker requested */
+					// We currently only know how to handle type 3 packets with code set to 21
+					if (avp_c[12] == 0x21) {
+						if (avp_len != 13) { // TNCC info requests are expected to be 13 bytes long
+							goto auth_unknown;
+						}
+
+						tncc_found = 1;
+						tncc_code = avp_c[12];
+						break;
+					}
+
+					if (avp_c[12] == 0x01) {
+						tncc_found = 1;
+						tncc_code = avp_c[12];
+						break;
+					}
+
+					goto auth_unknown;
 				default:
 					goto auth_unknown;
 				}
@@ -1682,7 +1876,7 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 	}
 
 	/* We want it to be precisely one type of request, not a mixture. */
-	if (realm_entry + !!realms_found + j2_found + gtc_found + cookie_found + !!old_sessions != 1 &&
+	if (realm_entry + !!realms_found + j2_found + gtc_found + tncc_found + cookie_found + !!old_sessions != 1 &&
 	    !signin_prompt) {
 	auth_unknown:
 		vpn_progress(vpninfo, PRG_ERR,
@@ -1728,6 +1922,16 @@ static int pulse_authenticate(struct openconnect_info *vpninfo, int connecting)
 			ret = pulse_request_user_auth(vpninfo, reqbuf, eap2_ident, prompt_flags,
 				(prompt_flags & PROMPT_PRIMARY) ? user_prompt : user2_prompt,
 				(prompt_flags & PROMPT_PRIMARY) ? pass_prompt : pass2_prompt);
+			if (ret)
+				goto out;
+		} else if (tncc_found) {
+			vpn_progress(vpninfo, PRG_TRACE, ("Pulse TNCC request\n"));
+			if (tncc_code == 0x21) {
+				ret = pulse_request_tncc_info(vpninfo, reqbuf);
+			} else if (tncc_code == 0x01) {
+				ret = pulse_request_tncc_reply(vpninfo, reqbuf);
+			}
+
 			if (ret)
 				goto out;
 		} else if (gtc_found) {

@@ -905,33 +905,44 @@ static int pulse_request_realm_choice(struct openconnect_info *vpninfo, struct o
 	return ret;
 }
 
+#define MSG "<parameter name=\"AntiVirus\" value=\"product_id=362;" \
+                                                  "product_sig=477;" \
+                                                  "product_name=Windows Defender;" \
+                                                  "vendor_name=Microsoft Corporation;" \
+                                                  "product_version=4.18.1902.5;" \
+                                                  "is_authentic=UNKNOWN;" \
+                                                  "translated_product_name=Windows Defender;" \
+                                                  "translated_vendor_name=Microsoft Corp.;" \
+                                                  "translated_product_version=4.18.1902.5;" \
+                                                  "gmt_offset=-60;" \
+                                                  "fsrtp=YES;" \
+                                                  "last_scan_time=;" \
+                                                  "data_file_details=time~%Y/%m/%d %T^version~1.305.3093.0|" \
+                                                  "virus_def_sig=;" \
+                                                  "def_update_in_progress=UNKNOWN;" \
+                                                  "scan_in_progress=YES;" \
+                                                  "services_running=UNKNOWN;" \
+                                                  "error=;\">" \
+                                                  "<parameter name=\"system_info\" value=\"os_version=2.6.2;sp_version=0;\">"
+
+// MSG size + size of time
+#define MSG_SIZE (sizeof(MSG) + 11)
+
 static int pulse_request_tncc_reply(struct openconnect_info *vpninfo, struct oc_text_buf *buf)
 {
-	const char *message = "<parameter name=\"AntiVirus\" value=\"product_id=362;"
-						  "product_sig=477;"
-						  "product_name=Windows Defender;"
-						  "vendor_name=Microsoft Corporation;"
-						  "product_version=4.18.1902.5;"
-						  "is_authentic=UNKNOWN;"
-						  "translated_product_name=Windows Defender;"
-						  "translated_vendor_name=Microsoft Corp.;"
-						  "translated_product_version=4.18.1902.5;"
-						  "gmt_offset=-60;"
-						  "fsrtp=YES;"
-						  "last_scan_time=;"
-						  "data_file_details=time~2019/11/30 16:27:24^version~1.305.3093.0|;"
-						  "virus_def_sig=;"
-						  "def_update_in_progress=UNKNOWN;"
-						  "scan_in_progress=YES;"
-						  "services_running=UNKNOWN;"
-						  "error=;\">"
-						  "<parameter name=\"system_info\" value=\"os_version=2.6.2;sp_version=0;\">";
+	char message[MSG_SIZE];
+	time_t rawtime;
+	struct tm *info;
 	const char *acceptLanguage = "Accept-Language: en-US";
 
 	struct oc_text_buf *reqbuf = buf_alloc();
 	struct oc_text_buf *encapsulation1 = buf_alloc();
 	struct oc_text_buf *encapsulation2 = buf_alloc();
 	char encapsulationBytes[9];
+
+	time(&rawtime);
+	info = localtime(&rawtime);
+	strftime(message,MSG_SIZE,MSG, info);
 
 	buf_append_avp_string_subtype(reqbuf, 0xce7, VENDOR_JUNIPER, 0x18, message, -1);
 
